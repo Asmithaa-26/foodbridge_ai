@@ -4,32 +4,37 @@ import numpy as np
 import joblib
 import json
 import plotly.express as px
-
+from sklearn.cluster import KMeans, DBSCAN
+import hdbscan # type: ignore
+from sklearn.preprocessing import StandardScaler
 from sentence_transformers import SentenceTransformer
 import faiss
-from sklearn.metrics.pairwise import cosine_similarity
+import math
+import google.generativeai as genai
 
+# Page Configuration
 st.set_page_config(page_title="FoodBridge AI", layout="wide")
 
 st.title("FoodBridge AI Platform")
 st.subheader("Intelligent Food Waste Redistribution System")
 
-DATA_PATH = "data/food_master_dataset.csv"
+# Data Loading
+DATA_PATH = r"E:\FoodBridge_AI\foodbridge\data\foodmaster_data.csv"
 
-df = pd.read_csv(DATA_PATH)
+@st.cache_data
+def load_data():
+    df = pd.read_csv(DATA_PATH)
+    # Ensure coordinates are present (Map city to lat/lon if they weren't in CSV)
+    # The uploaded CSV already has latitude and longitude, so we use those.
+    return df
 
-city_coords = {
-    "Chennai": (13.0827,80.2707),
-    "Bangalore": (12.9716,77.5946),
-    "Hyderabad": (17.3850,78.4867),
-    "Mumbai": (19.0760,72.8777),
-    "Delhi": (28.7041,77.1025)
-}
+try:
+    df = load_data()
+except Exception as e:
+    st.error(f"Error loading data: {e}")
+    st.stop()
 
-df["latitude"] = df["city"].map(lambda x: city_coords[x][0])
-df["longitude"] = df["city"].map(lambda x: city_coords[x][1])
-
-# Navigation
+# Navigation Sidebar
 page = st.sidebar.selectbox(
     "Select Module",
     [
@@ -42,356 +47,484 @@ page = st.sidebar.selectbox(
     ]
 )
 
-# ------------------------------------------------
-# PAGE 1 : ANALYTICS DASHBOARD
-# ------------------------------------------------
-
+# ----------------------------- DASHBOARD & CLUSTERING -----------------------------
 if page == "Dashboard Analytics":
 
-    st.header("FoodBridge AI Analytics Dashboard")
+    st.header("📊 FoodBridge AI Analytics Dashboard")
 
+    # (Keep your existing Metrics and City/Outlet charts here...)
     total_surplus = df["surplus_kg"].sum()
     total_prepared = df["total_prepared_kg"].sum()
     total_people = df["number_of_people"].sum()
     avg_surplus = df["surplus_kg"].mean()
-
-    people_fed = int(total_surplus * 3)
+    potential_meals = int(total_surplus * 3)
 
     col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Total Surplus (kg)", f"{total_surplus:,.2f}")
+    col2.metric("Total Prepared (kg)", f"{total_prepared:,.2f}")
+    col3.metric("People Served", f"{int(total_people):,}")
+    col4.metric("Avg Surplus", f"{avg_surplus:.2f}")
+    col5.metric("Potential Meals", f"{potential_meals:,}")
 
-    col1.metric("Total Surplus (kg)", round(total_surplus,2))
-    col2.metric("Total Prepared Food", round(total_prepared,2))
-    col3.metric("People Served", int(total_people))
-    col4.metric("Average Surplus", round(avg_surplus,2))
-    col5.metric("Potential Meals", people_fed)
+    # Visualizations
 
-    # ------------------------------------------------
-    # SURPLUS BY CITY
-    # ------------------------------------------------
+    c_left, c_right = st.columns(2)
 
-    st.subheader("Surplus Distribution by City")
+   
 
-    city_surplus = df.groupby("city")["surplus_kg"].sum().reset_index()
+    with c_left:
 
-    fig1 = px.bar(city_surplus, x="city", y="surplus_kg", color="city")
+        st.subheader("Surplus by City")
 
-    st.plotly_chart(fig1, theme="streamlit")
+        city_surplus = df.groupby("city")["surplus_kg"].sum().reset_index()
 
-    # ------------------------------------------------
-    # OUTLET TYPE CONTRIBUTION
-    # ------------------------------------------------
+        fig1 = px.bar(city_surplus, x="city", y="surplus_kg", color="city", template="plotly_white")
 
-    st.subheader("Outlet Type Contribution")
+        st.plotly_chart(fig1, use_container_width=True)
 
-    outlet_data = df.groupby("outlet_type")["surplus_kg"].sum().reset_index()
 
-    fig2 = px.pie(outlet_data, values="surplus_kg", names="outlet_type")
 
-    st.plotly_chart(fig2, theme="streamlit")
+    with c_right:
 
-    # ------------------------------------------------
-    # WEATHER IMPACT
-    # ------------------------------------------------
+        st.subheader("Outlet Type Contribution")
 
-    st.subheader("Weather Impact on Surplus")
+        outlet_data = df.groupby("outlet_type")["surplus_kg"].sum().reset_index()
 
-    weather_data = df.groupby("rainfall_category")["surplus_kg"].mean().reset_index()
+        fig2 = px.pie(outlet_data, values="surplus_kg", names="outlet_type", hole=0.4)
 
-    fig3 = px.bar(weather_data, x="rainfall_category", y="surplus_kg", color="rainfall_category")
+        st.plotly_chart(fig2, use_container_width=True)
 
-    st.plotly_chart(fig3, theme="streamlit")
 
-    # ------------------------------------------------
-    # LIVE SURPLUS MAP
-    # ------------------------------------------------
 
-    st.subheader("Live Food Surplus Locations")
+    # Map Visualization
+
+    st.subheader("📍 Live Food Surplus Locations")
 
     fig_map = px.scatter_mapbox(
-    df,
-    lat="latitude",
-    lon="longitude",
-    size="surplus_kg",
-    color="surplus_kg",
-    hover_name="city",
-    hover_data=["outlet_type","surplus_kg"],
-    zoom=4,
-    mapbox_style="open-street-map"
-)
 
-    st.plotly_chart(fig_map, theme="streamlit")
-    # ------------------------------------------------
-    # DATASET VIEWER
-    # ------------------------------------------------
+        df,
 
-    st.subheader("Dataset Explorer")
+        lat="latitude",
 
-    if st.checkbox("Show Raw Dataset"):
-        st.dataframe(df)
+        lon="longitude",
 
+        size="surplus_kg",
 
-# ------------------------------------------------
-# PAGE 2 : FOOD WASTE PREDICTION
-# ------------------------------------------------
+        color="surplus_kg",
 
+        hover_name="city",
+
+        hover_data=["outlet_type", "surplus_kg"],
+
+        zoom=4,
+
+        mapbox_style="open-street-map"
+
+    )
+
+    st.plotly_chart(fig_map, use_container_width=True)
+
+    # --- ADVANCED CLUSTERING SECTION ---
+    st.divider()
+    st.header("🔍 Advanced Surplus Clustering")
+    
+    # 1. Feature Selection
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if 'Unnamed: 0' in numeric_cols: numeric_cols.remove('Unnamed: 0')
+    
+    selected_features = st.multiselect(
+        "Select Features for Clustering", 
+        options=numeric_cols, 
+        default=["latitude", "longitude", "surplus_kg", "footfall_count"]
+    )
+
+    if len(selected_features) < 2:
+        st.warning("Please select at least two numeric features.")
+    else:
+        # Prep Data
+        X = df[selected_features].fillna(0).values
+        X_scaled = StandardScaler().fit_transform(X)
+
+        # 2. Algorithm Selection
+        c_alg1, c_alg2 = st.columns([1, 2])
+        algo_choice = c_alg1.radio("Algorithm", ["K-Means", "DBSCAN", "HDBSCAN"])
+        
+        if algo_choice == "K-Means":
+            k_val = c_alg2.slider("Clusters (K)", 2, 12, 5)
+            model = KMeans(n_clusters=k_val, random_state=42, n_init=10)
+            df["cluster"] = model.fit_predict(X_scaled)
+        elif algo_choice == "DBSCAN":
+            eps_val = c_alg2.slider("Epsilon", 0.1, 5.0, 0.5)
+            df["cluster"] = DBSCAN(eps=eps_val, min_samples=5).fit_predict(X_scaled)
+        else:
+            min_c = c_alg2.slider("Min Cluster Size", 2, 100, 10)
+            df["cluster"] = hdbscan.HDBSCAN(min_cluster_size=min_c).fit_predict(X_scaled)
+
+        # --- NEW VISUALIZATION SECTION ---
+        tab1, tab2, tab3 = st.tabs(["🗺️ Geospatial Map", "📦 Cluster Variance", "📊 Statistical Profiling"])
+
+        with tab1:
+            st.subheader("Geospatial Cluster Distribution")
+            fig_map = px.scatter_mapbox(
+                df, lat="latitude", lon="longitude", color=df["cluster"].astype(str),
+                size="surplus_kg", hover_name="city", zoom=4, 
+                mapbox_style="open-street-map", height=600
+            )
+            st.plotly_chart(fig_map, use_container_width=True)
+
+        with tab2:
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                st.subheader("3D Cluster Relationship")
+                # Use the first 3 selected features for 3D plot
+                feat_3d = selected_features[:3] if len(selected_features) >= 3 else selected_features + [selected_features[0]]
+                fig_3d = px.scatter_3d(
+                    df, x=feat_3d[0], y=feat_3d[1], z=feat_3d[2] if len(feat_3d)>2 else feat_3d[0],
+                    color=df["cluster"].astype(str), opacity=0.7,
+                    title=f"Relationship: {', '.join(feat_3d)}"
+                )
+                st.plotly_chart(fig_3d, use_container_width=True)
+
+            with col_b:
+                st.subheader("Cluster Size (Location Count)")
+                cluster_counts = df["cluster"].value_counts().reset_index()
+                cluster_counts.columns = ["Cluster", "Count"]
+                fig_bar = px.bar(cluster_counts, x="Cluster", y="Count", color="Cluster", 
+                                 text_auto=True, title="Locations per Cluster")
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+        with tab3:
+            st.subheader("Surplus Intensity by Cluster")
+            # Box plot shows the spread of surplus in each cluster
+            fig_box = px.box(
+                df, x=df["cluster"].astype(str), y="surplus_kg", 
+                color=df["cluster"].astype(str),
+                points="all", title="Surplus Weight Distribution per Cluster"
+            )
+            st.plotly_chart(fig_box, use_container_width=True)
+            
+            st.write("**Cluster Summary Table**")
+            summary = df.groupby("cluster")[selected_features].mean()
+            st.dataframe(summary.style.background_gradient(cmap='Blues'))
+# ---------------------- FOOD WASTE PREDICTION ----------------------
 elif page == "Food Waste Prediction":
+    st.header("🔮 Surplus Prediction Engine")
+    
+    # Note: These paths must point to your local saved model files
+    try:
+        regressor = joblib.load(r"E:\FoodBridge_AI\foodbridge\saved_models\foodbridge_regressor.pkl")
+        classifier = joblib.load(r"E:\FoodBridge_AI\foodbridge\saved_models\waste_classifier.pkl")
+        with open(r"E:\FoodBridge_AI\foodbridge\saved_models\model_features.json") as f:
+            reg_features = json.load(f)
+        with open(r"E:\FoodBridge_AI\foodbridge\saved_models\classifier_features.json") as f:
+            clf_features = json.load(f)
+    except:
+        st.warning("Model files not found. Please ensure .pkl and .json files are in the 'saved_models' directory.")
+        st.stop()
 
-    regressor = joblib.load("saved_models/foodbridge_regressor.pkl")
-    classifier = joblib.load("saved_models/waste_classifier.pkl")
-
-    with open("saved_models/model_features.json") as f:
-        reg_features = json.load(f)
-
-    with open("saved_models/classifier_features.json") as f:
-        clf_features = json.load(f)
-
-    def prepare_input(data,features):
-
-        df_input=pd.DataFrame([data])
-        df_input=pd.get_dummies(df_input)
-
+    def prepare_input(data, features):
+        df_input = pd.DataFrame([data])
+        df_input = pd.get_dummies(df_input)
         for col in features:
             if col not in df_input.columns:
-                df_input[col]=0
+                df_input[col] = 0
+        return df_input[features]
 
-        df_input=df_input[features]
+    # Sidebar inputs
+    st.sidebar.header("Input Parameters")
+    number_of_people = st.sidebar.slider("Number of People", 10, 1000, 100)
+    meals_per_person = st.sidebar.slider("Meals per Person", 1.0, 3.0, 1.5)
+    footfall_count = st.sidebar.slider("Footfall", 10, 1000, 120)
+    total_prepared_kg = st.sidebar.slider("Prepared Food (kg)", 10, 1000, 200)
+    rainfall_mm = st.sidebar.slider("Rainfall (mm)", 0, 100, 5)
+    temperature_c = st.sidebar.slider("Temperature (°C)", 10, 45, 30)
+    
+    city = st.sidebar.selectbox("City", df['city'].unique())
+    outlet_type = st.sidebar.selectbox("Outlet Type", df['outlet_type'].unique())
+    rainfall_cat = st.sidebar.selectbox("Rainfall Category", ["low", "medium", "high"])
 
-        return df_input
-
-
-    st.sidebar.header("Input Data")
-
-    number_of_people=st.sidebar.slider("Number of People",10,1000,100)
-
-    meals_per_person=st.sidebar.slider("Meals per Person",1.0,3.0,1.5)
-
-    footfall_count=st.sidebar.slider("Footfall",10,1000,120)
-
-    total_prepared_kg=st.sidebar.slider("Prepared Food (kg)",10,1000,200)
-
-    rainfall_mm=st.sidebar.slider("Rainfall",0,100,5)
-
-    temperature_c=st.sidebar.slider("Temperature",10,45,30)
-
-    city=st.sidebar.selectbox("City",["Chennai","Bangalore","Hyderabad","Mumbai","Delhi"])
-
-    district=st.sidebar.selectbox("District",
-    ["Chennai","Bangalore Urban","Hyderabad","Mumbai Suburban","New Delhi"])
-
-    outlet_type=st.sidebar.selectbox("Outlet Type",["restaurant","supermarket","farm"])
-
-    rainfall_category=st.sidebar.selectbox("Rainfall Category",["low","medium","high"])
-
-    temperature_category=st.sidebar.selectbox("Temperature Category",["cool","moderate","hot"])
-
-
-    input_data={
-        "number_of_people":number_of_people,
-        "meals_per_person":meals_per_person,
-        "footfall_count":footfall_count,
-        "total_prepared_kg":total_prepared_kg,
-        "rainfall_mm":rainfall_mm,
-        "temperature_c":temperature_c,
-        "city":city,
-        "district":district,
-        "outlet_type":outlet_type,
-        "rainfall_category":rainfall_category,
-        "temperature_category":temperature_category
+    input_data = {
+        "number_of_people": number_of_people,
+        "meals_per_person": meals_per_person,
+        "footfall_count": footfall_count,
+        "total_prepared_kg": total_prepared_kg,
+        "rainfall_mm": rainfall_mm,
+        "temperature_c": temperature_c,
+        "city": city,
+        "outlet_type": outlet_type,
+        "rainfall_category": rainfall_cat
     }
 
-    if st.button("Predict Food Waste"):
+    if st.button("Generate Prediction"):
+        X_reg = prepare_input(input_data, reg_features)
+        X_clf = prepare_input(input_data, clf_features)
+        surplus = regressor.predict(X_reg)[0]
+        waste_level = classifier.predict(X_clf)[0]
+        
+        st.success("Analysis Complete")
+        c1, c2 = st.columns(2)
+        c1.metric("Predicted Surplus (kg)", f"{surplus:.2f}")
+        c2.metric("Waste Level Classification", waste_level)
 
-        X_reg=prepare_input(input_data,reg_features)
-        X_clf=prepare_input(input_data,clf_features)
-
-        surplus=regressor.predict(X_reg)[0]
-        waste_level=classifier.predict(X_clf)[0]
-
-        st.success("Prediction Results")
-
-        c1,c2=st.columns(2)
-
-        c1.metric("Predicted Surplus (kg)",round(surplus,2))
-        c2.metric("Waste Level",waste_level)
-
-
-# ------------------------------------------------
-# PAGE 3 : CHATBOT
-# ------------------------------------------------
-
+# --------------------- CHATBOT ---------------------
+# --- CONFIGURATION ---
+# Get your FREE key at: https://aistudio.google.com/
 elif page == "FoodBridge AI Assistant":
 
-    st.header("AI Volunteer Assistant")
+    st.header("🤖 FoodBridge AI Assistant")
+    st.caption("⚡ Powered by Hybrid AI: RAG (BGE) + Smart Intent Detection")
+    if "GEMINI_API_KEY" in st.secrets:
+        GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+    else:
+    # Use your fallback for local testing if the file is missing
+        GEMINI_API_KEY = "YOUR_api_key"
 
-    documents=[
-    "Food surplus should be redistributed within six hours.",
-    "Cooked food must be stored below five degree Celsius.",
-    "NGOs collect surplus food from restaurants.",
-    "Volunteers must inspect food quality before distribution.",
-    "Transportation should minimize travel time to reduce waste."
-    ]
+    genai.configure(api_key=GEMINI_API_KEY)
 
-    model=SentenceTransformer("all-MiniLM-L6-v2")
+# --- KNOWLEDGE BASE ---
+    documents = [
+    "Food surplus should be redistributed within six hours of preparation to ensure safety.",
+    "All cooked food must be stored below five degrees Celsius to prevent bacterial growth.",
+    "NGOs are responsible for the collection of surplus food from verified restaurants.",
+    "Volunteers must perform a visual and smell test on food before distribution.",
+    "Route optimization should prioritize high-density poverty areas to minimize travel.",
+    "Donors are required to sign a food safety disclaimer during the handover process.",
+    "Shelters must update their requirement status every 4 hours for fair distribution.",
+    "Transportation vehicles should be kept clean and food containers must be airtight."
+]
 
-    doc_vectors=model.encode(documents)
+    @st.cache_resource
+    def load_resources():
+        """Load BGE Embedding model and FAISS Index"""
+        # Lightweight model (~100MB) perfect for Hugging Face Free CPU
+        model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+        doc_vectors = model.encode(documents, normalize_embeddings=True)
+        index = faiss.IndexFlatIP(doc_vectors.shape[1])
+        index.add(np.array(doc_vectors).astype('float32'))
+        return model, index
 
-    dim=doc_vectors.shape[1]
-
-    index=faiss.IndexFlatL2(dim)
-
-    index.add(np.array(doc_vectors))
-
-
-    def chatbot(query):
-
-        q_vec=model.encode([query])
-
-        dist,ind=index.search(np.array(q_vec),k=2)
-
-        context=" ".join([documents[i] for i in ind[0]])
-
-        return context
-
-
-    question=st.text_input("Ask a question")
-
-    if st.button("Ask Assistant"):
-
-        answer=chatbot(question)
-
-        st.success("Response")
-
-        st.write(answer)
-
-
-# ------------------------------------------------
-# PAGE 4 : SENTIMENT ANALYSIS
-# ------------------------------------------------
-
-elif page == "Sentiment Analysis":
-
-    st.header("Feedback Sentiment Analysis")
-
-    model=joblib.load("saved_models/sentiment_model.pkl")
-
-    vectorizer=joblib.load("saved_models/tfidf_vectorizer.pkl")
-
-    text=st.text_area("Enter feedback")
-
-    if st.button("Analyze"):
-
-        vec=vectorizer.transform([text])
-
-        pred=model.predict(vec)[0]
-
-        st.metric("Sentiment",pred)
-
-
-# ------------------------------------------------
-# PAGE 5 : TRANSLATION
-# ------------------------------------------------
-
-elif page == "Language Translation":
-
-    st.header("Volunteer Language Translator")
-
-    from transformers import MBartForConditionalGeneration,MBart50TokenizerFast
-
-    model_name="facebook/mbart-large-50-many-to-many-mmt"
-
-    tokenizer=MBart50TokenizerFast.from_pretrained(model_name)
-
-    model=MBartForConditionalGeneration.from_pretrained(model_name)
-
-    tokenizer.src_lang="en_XX"
-
-    text=st.text_area("Enter English Text")
-
-    if st.button("Translate"):
-
-        encoded=tokenizer(text,return_tensors="pt")
-
-        tokens=model.generate(
-            **encoded,
-            forced_bos_token_id=tokenizer.lang_code_to_id["ta_IN"]
+    embed_model, faiss_index = load_resources()
+    llm_model = genai.GenerativeModel('gemini-2.5-flash')
+# --- LOGIC FUNCTIONS ---
+    def get_ai_response(user_query):
+    # 1. RAG Check (FoodBridge Specifics)
+        instruction = "Represent this sentence for searching relevant passages: "
+        q_vec = embed_model.encode([instruction + user_query], normalize_embeddings=True).astype('float32')
+        dist, indices = faiss_index.search(q_vec, k=1)
+    
+    # 0.7+ is a strong match for BGE similarity
+        if dist[0][0] > 0.7:
+            return f"📍 **FoodBridge Protocol:** {documents[indices[0][0]]}", "safety"
+    
+    # 2. Gemini Fallback (General Chat)
+        try:
+            response = llm_model.generate_content(
+                f"Role: You are the FoodBridge AI Assistant. Be helpful and concise. \nUser: {user_query}"
         )
+            return response.text, "general"
+        except Exception as e:
+            return "I'm currently optimizing routes and my general brain is offline. Ask me about food safety!", "error"
 
-        translation=tokenizer.batch_decode(tokens,skip_special_tokens=True)
+# --- UI LAYOUT ---
+    st.title("🤖 FoodBridge AI Assistant")
+    st.markdown("---")
 
-        st.success("Tamil Translation")
+# Initialize chat history
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-        st.write(translation[0])
+# Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+# User Input
+    if prompt := st.chat_input("How can I help you today?"):
+    # Add user message to history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+    # Generate and display response
+        with st.chat_message("assistant"):
+            with st.spinner("Processing..."):
+                ans, msg_type = get_ai_response(prompt)
+                st.markdown(ans)
+    
+    # Add assistant response to history
+        st.session_state.messages.append({"role": "assistant", "content": ans})
+
+# Sidebar: Helper Tools
+    with st.sidebar:
+        if st.button("🗑️ Clear Chat History"):
+            st.session_state.messages = []
+            st.rerun()
+        st.info("This assistant uses a Hybrid RAG + Gemini Flash architecture.")
+# ----------------------------- 4. TRANSFORMER-POWERED SENTIMENT ANALYSIS -----------------------------
+elif page == "Sentiment Analysis":
+    st.header("💬 Advanced Sentiment Analysis")
+    st.info("Using a pre-trained DistilBERT model for deep contextual understanding of feedback.")
+
+    from transformers import pipeline
+
+    @st.cache_resource
+    def load_sentiment_pipeline():
+        # This downloads a model fine-tuned on the SST-2 (Stanford Sentiment Treebank) dataset
+        return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+
+    try:
+        sentiment_analyzer = load_sentiment_pipeline()
         
-# ------------------------------------------------
-# PAGE 6 : ROUTE OPTIMIZATION
-# ------------------------------------------------
+        text = st.text_area("Enter volunteer or donor feedback:", 
+                            placeholder="Example: The distribution was delayed, but the food quality was surprisingly good.")
 
+        if st.button("Analyze Sentiment"):
+            if text.strip() == "":
+                st.warning("Please enter some feedback text.")
+            else:
+                with st.spinner("Analyzing context..."):
+                    # The model returns a list of dicts: [{'label': 'POSITIVE', 'score': 0.99}]
+                    result = sentiment_analyzer(text)[0]
+                    label = result['label']
+                    score = result['score']
+
+                    # UI Styling based on result
+                    if label == "POSITIVE":
+                        st.balloons()
+                        st.success(f"### Result: {label}")
+                    else:
+                        st.error(f"### Result: {label}")
+
+                    st.metric("Confidence Score", f"{score*100:.2f}%")
+                    
+                    # Progress bar for visual representation
+                    st.write("Model Certainty:")
+                    st.progress(score)
+
+                    with st.expander("Why this result?"):
+                        st.write("""
+                        Unlike basic word-matching, this Transformer model (DistilBERT) 
+                        looks at the relationship between every word in your sentence. 
+                        It can detect if a positive word is being negated or if the 
+                        overall tone is frustrated despite having 'good' words.
+                        """)
+
+    except Exception as e:
+        st.error("Could not load the Transformer model. Ensure you have 'transformers' and 'torch' installed.")
+        st.info("Run: pip install transformers torch")
+
+# ----------------------------- 5. MULTI-LANGUAGE VOLUNTEER TRANSLATOR -----------------------------
+elif page == "Language Translation":
+    st.header("🌐 Multi-Language Volunteer Translator")
+    st.info("Translate instructions and food safety guidelines into local Indian languages.")
+
+    from transformers import MBartForConditionalGeneration, MBart50TokenizerFast
+
+    # Dictionary mapping for supported Indian languages in mBART-50
+    SUPPORTED_LANGUAGES = {
+        "Tamil": "ta_IN",
+        "Hindi": "hi_IN",
+        "Telugu": "te_IN",
+        "Malayalam": "ml_IN",
+        "Marathi": "mr_IN",
+        "Bengali": "bn_IN"
+        
+          # Note: verify model support, standard mbart-50-many-to-many supports these
+    }
+
+    @st.cache_resource
+    def load_translator():
+        model_name = "facebook/mbart-large-50-many-to-many-mmt"
+        tokenizer = MBart50TokenizerFast.from_pretrained(model_name)
+        model = MBartForConditionalGeneration.from_pretrained(model_name)
+        return tokenizer, model
+
+    tokenizer, model = load_translator()
+
+    # Layout for language selection
+    col_lang1, col_lang2 = st.columns(2)
+    
+    with col_lang1:
+        src_lang = st.selectbox("Source Language", ["English"], index=0)
+        # mBART code for English
+        tokenizer.src_lang = "en_XX"
+
+    with col_lang2:
+        target_lang_name = st.selectbox("Target Local Language", list(SUPPORTED_LANGUAGES.keys()))
+        target_lang_code = SUPPORTED_LANGUAGES[target_lang_name]
+
+    text = st.text_area("Enter text to translate:", 
+                        placeholder="e.g., Please ensure the food is distributed to the shelter before 6 PM.")
+
+    if st.button("Translate Now"):
+        if text.strip() == "":
+            st.warning("Please enter some text to translate.")
+        else:
+            with st.spinner(f"Translating to {target_lang_name}..."):
+                try:
+                    # Tokenize input
+                    encoded_input = tokenizer(text, return_tensors="pt")
+                    
+                    # Generate translation using the forced language code
+                    generated_tokens = model.generate(
+                        **encoded_input, 
+                        forced_bos_token_id=tokenizer.lang_code_to_id[target_lang_code]
+                    )
+                    
+                    # Decode output
+                    translation = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+                    
+                    st.divider()
+                    st.subheader(f"Result ({target_lang_name})")
+                    st.success(translation)
+                    
+                    # Helpful feature: Copy-paste helper
+                    st.code(translation, language='text')
+                    st.caption("You can copy the translated text above for use in WhatsApp or SMS alerts.")
+                
+                except Exception as e:
+                    st.error(f"Translation Error: {e}")
+
+# --------------------- NGO ROUTE OPTIMIZATION ---------------------
 elif page == "NGO Route Optimization":
-
-    st.header("NGO Food Collection Route Optimization")
-
-    st.write("This module finds the most efficient route for collecting surplus food from multiple locations.")
-
-    locations = df.groupby("city")[["latitude","longitude"]].mean().reset_index()
-
-    st.subheader("Available Collection Locations")
-
+    st.header("🚚 NGO Food Collection Route Optimization")
+    st.write("Calculates the most efficient path between cities to minimize travel time.")
+    
+    locations = df.groupby("city")[["latitude", "longitude"]].mean().reset_index()
     st.dataframe(locations)
 
-    import math
-
     def distance(coord1, coord2):
-        return math.sqrt(
-            (coord1[0]-coord2[0])**2 +
-            (coord1[1]-coord2[1])**2
-        )
+        return math.sqrt((coord1[0]-coord2[0])**2 + (coord1[1]-coord2[1])**2)
 
     coords = locations[["latitude","longitude"]].values
-
     n = len(coords)
-
     dist_matrix = np.zeros((n,n))
-
     for i in range(n):
         for j in range(n):
-            dist_matrix[i][j] = distance(coords[i],coords[j])
+            dist_matrix[i][j] = distance(coords[i], coords[j])
 
+    # Simple Nearest Neighbor TSP Algorithm
     visited = [False]*n
-
     route = [0]
-
     visited[0] = True
-
     for _ in range(n-1):
-
         last = route[-1]
-
         next_city = None
-
         min_dist = float("inf")
-
         for j in range(n):
-
             if not visited[j] and dist_matrix[last][j] < min_dist:
-
                 min_dist = dist_matrix[last][j]
-
                 next_city = j
-
         route.append(next_city)
-
         visited[next_city] = True
-
-    route.append(0)
-
+    route.append(0) # Return to start
+    
     route_cities = locations.iloc[route]["city"].tolist()
-
-    st.subheader("Optimized NGO Collection Route")
-
-    st.write(" → ".join(route_cities))
-
+    st.subheader("Optimized Route Sequence")
+    st.write(" ➔ ".join(route_cities))
+    
     route_df = locations.iloc[route]
-
     fig = px.line_mapbox(
         route_df,
         lat="latitude",
@@ -400,7 +533,5 @@ elif page == "NGO Route Optimization":
         zoom=4,
         mapbox_style="open-street-map"
     )
-
-    st.plotly_chart(fig,theme="streamlit")
-
-    st.success("Optimized route reduces travel distance and food spoilage risk.")
+    st.plotly_chart(fig, use_container_width=True)
+    st.success("This route reduces travel distance and potential food spoilage.")
